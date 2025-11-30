@@ -10,7 +10,15 @@ import os
 import time
 import signal
 import threading
+import warnings
 from typing import Optional, List, Set
+
+# Désactiver les warnings et erreurs Scapy
+warnings.filterwarnings("ignore")
+import logging
+logging.getLogger("scapy.runtime").setLevel(logging.ERROR)
+logging.getLogger("scapy.loading").setLevel(logging.ERROR)
+logging.getLogger("scapy").setLevel(logging.ERROR)
 
 import typer
 from rich.console import Console
@@ -21,6 +29,11 @@ from rich.text import Text
 from rich.live import Live
 from rich.layout import Layout
 from rich.progress import Progress, SpinnerColumn, TextColumn
+
+# Configurer Scapy pour ignorer les erreurs d'interface
+from scapy.all import conf as scapy_conf
+scapy_conf.verb = 0  # Mode silencieux
+scapy_conf.iface = None  # Sera défini plus tard
 
 # Core imports
 from core.logger import log, console
@@ -108,6 +121,9 @@ class FoxState:
 state = FoxState()
 system_ctrl = SystemControl()
 
+# Flag pour savoir si on est dans une opération interruptible
+_in_operation = False
+
 
 # ╔══════════════════════════════════════════════════════════════════╗
 # ║                        UTILITIES                                  ║
@@ -151,26 +167,82 @@ def display_banner():
 
 
 def setup_network() -> bool:
-    """Configuration automatique du réseau."""
+    """Configuration automatique du réseau avec option de sélection manuelle."""
     console.print("\n[yellow]⚙️  Auto-configuration du réseau...[/]\n")
     
     try:
         discovery = NetworkDiscovery()
         
-        if not discovery.auto_configure():
-            log.error("Échec de l'auto-configuration")
+        # Lister toutes les interfaces disponibles
+        interfaces = discovery.get_all_interfaces()
+        
+        if not interfaces:
+            log.error("Aucune interface réseau trouvée!")
             return False
+        
+        # Si plusieurs interfaces, proposer le choix
+        if len(interfaces) > 1:
+            console.print("[bold]Interfaces réseau disponibles:[/]\n")
+            
+            table = Table(border_style="cyan")
+            table.add_column("#", style="bold")
+            table.add_column("Nom", style="cyan")
+            table.add_column("IP", style="green")
+            table.add_column("Gateway", style="yellow")
+            table.add_column("Subnet", style="blue")
+            
+            for i, iface in enumerate(interfaces, 1):
+                gw_status = iface.gateway or "[dim]Aucune[/]"
+                table.add_row(
+                    str(i),
+                    iface.display_name[:40],
+                    iface.ip,
+                    gw_status,
+                    iface.cidr
+                )
+            
+            console.print(table)
+            console.print()
+            
+            # Sélection auto ou manuelle
+            choice = Prompt.ask(
+                "[bold]Choisir interface[/] (Entrée = auto)",
+                default="auto"
+            )
+            
+            if choice.lower() == "auto":
+                iface = discovery.get_best_interface()
+            else:
+                try:
+                    idx = int(choice) - 1
+                    if 0 <= idx < len(interfaces):
+                        iface = interfaces[idx]
+                    else:
+                        iface = discovery.get_best_interface()
+                except ValueError:
+                    iface = discovery.get_best_interface()
+        else:
+            iface = interfaces[0]
+        
+        if not iface:
+            log.error("Aucune interface valide sélectionnée!")
+            return False
+        
+        # Configurer avec l'interface choisie
+        discovery.configure_from_interface(iface)
         
         # Afficher la configuration
         table = Table(title="🌐 Configuration Réseau", border_style="green")
         table.add_column("Paramètre", style="cyan")
         table.add_column("Valeur", style="green")
         
-        table.add_row("Interface", conf.interface)
+        # Afficher le nom lisible de l'interface si disponible
+        iface_display = conf.interface_display or conf.interface
+        table.add_row("Interface", iface_display)
         table.add_row("IP Attaquant", conf.attacker_ip)
         table.add_row("MAC Attaquant", conf.attacker_mac)
         table.add_row("Gateway IP", conf.gateway_ip)
-        table.add_row("Gateway MAC", conf.gateway_mac)
+        table.add_row("Gateway MAC", conf.gateway_mac or "(résolution...)")
         table.add_row("Subnet", conf.subnet)
         
         console.print(table)
@@ -183,17 +255,15 @@ def setup_network() -> bool:
         return False
 
 
-def signal_handler(signum, frame):
-    """Handler pour Ctrl+C."""
-    console.print("\n[yellow]⚠️  Interruption détectée...[/]")
+def cleanup_and_exit():
+    """Nettoyage complet et sortie."""
+    console.print("\n[yellow]⚠️  Arrêt de FoxProwl...[/]")
     state.stop_all()
-    system_ctrl.cleanup()
+    try:
+        system_ctrl.cleanup()
+    except Exception:
+        pass
     console.print("[green]✓ Nettoyage terminé[/]")
-    sys.exit(0)
-
-
-# Enregistrer le handler
-signal.signal(signal.SIGINT, signal_handler)
 
 
 # ╔══════════════════════════════════════════════════════════════════╗
@@ -566,11 +636,16 @@ def interactive_menu():
                 console.print()
         
         console.print()
-        choice = Prompt.ask(
-            "[bold green]Choix[/]",
-            choices=["1", "2", "3", "4", "5", "6", "7", "8", "s", "x", "q"],
-            default="1"
-        )
+        
+        try:
+            choice = Prompt.ask(
+                "[bold green]Choix[/]",
+                choices=["1", "2", "3", "4", "5", "6", "7", "8", "s", "x", "q"],
+                default="1"
+            )
+        except KeyboardInterrupt:
+            console.print("\n[dim]Ctrl+C détecté. Tapez 'q' pour quitter.[/]")
+            continue
         
         try:
             if choice == "1":
@@ -594,14 +669,12 @@ def interactive_menu():
             elif choice == "x":
                 menu_stop_all()
             elif choice == "q":
-                console.print("\n[yellow]Arrêt de FoxProwl...[/]")
-                state.stop_all()
-                system_ctrl.cleanup()
+                cleanup_and_exit()
                 console.print("[green]Au revoir! 🦊[/]")
                 break
         
         except KeyboardInterrupt:
-            console.print("\n[dim]Retour au menu...[/]")
+            console.print("\n[dim]Opération interrompue. Retour au menu...[/]")
         except Exception as e:
             log.error(f"Erreur: {e}")
 

@@ -14,6 +14,7 @@ class NetworkConfig:
     """Configuration réseau de l'attaquant."""
     # Interface et identité
     interface: str = ""
+    interface_display: str = ""  # Nom lisible de l'interface
     attacker_ip: str = ""
     attacker_mac: str = ""
     

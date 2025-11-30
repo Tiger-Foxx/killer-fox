@@ -12,7 +12,16 @@ from typing import List, Dict, Optional, Tuple
 from dataclasses import dataclass
 
 import netifaces
-from scapy.all import conf as scapy_conf, get_if_hwaddr, get_if_list, srp, Ether, ARP
+from scapy.all import (
+    conf as scapy_conf, 
+    get_if_hwaddr, 
+    get_if_list, 
+    srp, 
+    Ether, 
+    ARP,
+    get_if_addr,
+    IFACES
+)
 
 from core.logger import log
 from core.config import conf
@@ -21,7 +30,8 @@ from core.config import conf
 @dataclass
 class InterfaceInfo:
     """Informations sur une interface réseau."""
-    name: str
+    name: str           # Nom pour Scapy
+    display_name: str   # Nom lisible pour l'affichage
     ip: str
     mac: str
     netmask: str
@@ -42,10 +52,75 @@ class NetworkDiscovery:
     def get_all_interfaces(cls) -> List[InterfaceInfo]:
         """
         Récupère toutes les interfaces réseau valides.
-        Exclut loopback, docker, etc.
+        Sur Windows, utilise Scapy IFACES pour la compatibilité.
         """
         interfaces = []
-        excluded_prefixes = ('lo', 'docker', 'veth', 'br-', 'virbr', 'vbox', 'vmnet')
+        
+        if cls.IS_WINDOWS:
+            interfaces = cls._get_windows_interfaces()
+        else:
+            interfaces = cls._get_linux_interfaces()
+        
+        return interfaces
+    
+    @classmethod
+    def _get_windows_interfaces(cls) -> List[InterfaceInfo]:
+        """Récupère les interfaces sur Windows via Scapy."""
+        interfaces = []
+        
+        try:
+            # Utiliser Scapy IFACES qui gère correctement Windows
+            for iface in IFACES.values():
+                try:
+                    # Filtrer les interfaces sans IP ou avec IP locale
+                    ip = iface.ip
+                    if not ip or ip.startswith('127.') or ip == '0.0.0.0':
+                        continue
+                    
+                    # Filtrer loopback
+                    if 'loopback' in iface.name.lower():
+                        continue
+                    
+                    mac = iface.mac
+                    if not mac or mac == '00:00:00:00:00:00':
+                        continue
+                    
+                    # Calculer le CIDR
+                    netmask = cls._get_netmask_for_ip(ip)
+                    cidr = cls._calculate_cidr(ip, netmask)
+                    
+                    # Gateway
+                    gateway = cls._get_gateway(iface.name)
+                    
+                    # Le vrai nom Scapy pour Windows
+                    scapy_name = iface.name
+                    display = iface.description if hasattr(iface, 'description') else iface.name
+                    
+                    interfaces.append(InterfaceInfo(
+                        name=scapy_name,
+                        display_name=display[:50],
+                        ip=ip,
+                        mac=mac,
+                        netmask=netmask,
+                        cidr=cidr,
+                        gateway=gateway,
+                        is_up=True,
+                        is_wireless='wi-fi' in display.lower() or 'wireless' in display.lower(),
+                        supports_monitor=False
+                    ))
+                except Exception:
+                    continue
+        
+        except Exception as e:
+            log.error(f"Erreur énumération interfaces Windows: {e}")
+        
+        return interfaces
+    
+    @classmethod
+    def _get_linux_interfaces(cls) -> List[InterfaceInfo]:
+        """Récupère les interfaces sur Linux."""
+        interfaces = []
+        excluded_prefixes = ('lo', 'docker', 'veth', 'br-', 'virbr')
         
         try:
             for iface_name in netifaces.interfaces():
@@ -84,6 +159,7 @@ class NetworkDiscovery:
                 
                 interfaces.append(InterfaceInfo(
                     name=iface_name,
+                    display_name=iface_name,
                     ip=ip,
                     mac=mac,
                     netmask=netmask,
@@ -91,13 +167,27 @@ class NetworkDiscovery:
                     gateway=gateway,
                     is_up=True,
                     is_wireless=is_wireless,
-                    supports_monitor=is_wireless and cls.IS_LINUX
+                    supports_monitor=is_wireless
                 ))
         
         except Exception as e:
-            log.error(f"Erreur lors de l'énumération des interfaces: {e}")
+            log.error(f"Erreur énumération interfaces Linux: {e}")
         
         return interfaces
+    
+    @classmethod
+    def _get_netmask_for_ip(cls, ip: str) -> str:
+        """Récupère le masque réseau pour une IP donnée."""
+        try:
+            for iface_name in netifaces.interfaces():
+                addrs = netifaces.ifaddresses(iface_name)
+                if netifaces.AF_INET in addrs:
+                    for addr_info in addrs[netifaces.AF_INET]:
+                        if addr_info.get('addr') == ip:
+                            return addr_info.get('netmask', '255.255.255.0')
+        except Exception:
+            pass
+        return '255.255.255.0'
     
     @classmethod
     def _get_mac_address(cls, iface_name: str, addrs: dict = None) -> str:
@@ -128,17 +218,14 @@ class NetworkDiscovery:
             return ""
     
     @classmethod
-    def _get_gateway(cls, iface_name: str) -> str:
-        """Récupère l'adresse de la gateway."""
+    def _get_gateway(cls, iface_name: str = None) -> str:
+        """Récupère l'adresse de la gateway par défaut."""
         try:
             gateways = netifaces.gateways()
             default_gw = gateways.get('default', {}).get(netifaces.AF_INET)
             
             if default_gw:
-                gw_ip, gw_iface = default_gw[0], default_gw[1]
-                # Sur Windows, le nom d'interface peut être différent
-                if cls.IS_WINDOWS or gw_iface == iface_name:
-                    return gw_ip
+                return default_gw[0]
         except Exception:
             pass
         
@@ -170,7 +257,7 @@ class NetworkDiscovery:
     def get_best_interface(cls) -> Optional[InterfaceInfo]:
         """
         Sélectionne automatiquement la meilleure interface.
-        Préfère: 1) Interface avec gateway, 2) IP privée, 3) Interface filaire
+        Préfère: 1) Interface avec gateway dans le même subnet, 2) IP privée, 3) Non-VirtualBox
         """
         interfaces = cls.get_all_interfaces()
         
@@ -180,16 +267,38 @@ class NetworkDiscovery:
         # Trier par priorité
         def score(iface: InterfaceInfo) -> int:
             s = 0
+            
+            # Vérifier si la gateway est dans le même subnet
+            if iface.gateway and iface.cidr:
+                try:
+                    network = ipaddress.IPv4Network(iface.cidr, strict=False)
+                    gw_ip = ipaddress.IPv4Address(iface.gateway)
+                    if gw_ip in network:
+                        s += 200  # Très haute priorité si GW dans le subnet
+                except Exception:
+                    pass
+            
             if iface.gateway:
                 s += 100
             if iface.ip.startswith(('192.168.', '10.', '172.')):
                 s += 50
             if not iface.is_wireless:
                 s += 10
+            
+            # Pénaliser les interfaces VirtualBox/VMware
+            display_lower = iface.display_name.lower()
+            if any(v in display_lower for v in ['virtualbox', 'vmware', 'vbox', 'host-only']):
+                s -= 150
+            
             return s
         
         interfaces.sort(key=score, reverse=True)
         return interfaces[0]
+    
+    @classmethod
+    def list_interfaces_for_selection(cls) -> List[InterfaceInfo]:
+        """Liste toutes les interfaces pour sélection manuelle."""
+        return cls.get_all_interfaces()
     
     @classmethod
     def resolve_mac(cls, ip: str, iface: str = None, timeout: float = 2.0) -> Optional[str]:
@@ -261,6 +370,17 @@ class NetworkDiscovery:
         conf.subnet = iface.cidr
         conf.netmask = iface.netmask
         
+        # Stocker le nom d'affichage si disponible
+        if hasattr(iface, 'display_name'):
+            conf.interface_display = iface.display_name
+        
+        # Configurer Scapy globalement avec la bonne interface
+        try:
+            scapy_conf.iface = iface.name
+            scapy_conf.verb = 0  # Mode silencieux
+        except Exception:
+            pass
+        
         # Résoudre la MAC de la gateway
         if iface.gateway:
             gw_mac = cls.resolve_mac(iface.gateway, iface.name)
@@ -282,8 +402,9 @@ class NetworkDiscovery:
         
         cls.configure_from_interface(iface)
         
-        # Afficher la config
-        log.success(f"Interface: {conf.interface}")
+        # Afficher la config avec le nom lisible si disponible
+        display_name = getattr(iface, 'display_name', iface.name)
+        log.success(f"Interface: {display_name}")
         log.info(f"IP Attaquant: {conf.attacker_ip}")
         log.info(f"MAC Attaquant: {conf.attacker_mac}")
         log.info(f"Gateway: {conf.gateway_ip} ({conf.gateway_mac or 'MAC en cours...'})")

@@ -7,7 +7,7 @@ from .network import NetworkDiscovery
 from .mitigation import SystemControl
 from .utils import (
     resolve_domain,
-    domain_matches,
+    expand_domain_wildcards,
     is_valid_ip,
     expand_cidr,
     Counter,
@@ -24,7 +24,7 @@ __all__ = [
     'NetworkDiscovery',
     'SystemControl',
     'resolve_domain',
-    'domain_matches',
+    'expand_domain_wildcards',
     'is_valid_ip',
     'expand_cidr',
     'Counter',

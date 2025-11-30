@@ -207,6 +207,21 @@ class SystemControl:
     def cleanup_now(cls):
         """Force le nettoyage immédiat."""
         cls._do_cleanup()
+    
+    @classmethod
+    def cleanup(cls):
+        """Alias pour cleanup_now() - pour compatibilité."""
+        cls._do_cleanup()
+    
+    @classmethod
+    def enable_ip_forwarding(cls) -> bool:
+        """Active l'IP forwarding."""
+        return cls.set_ip_forwarding(True)
+    
+    @classmethod
+    def disable_ip_forwarding(cls) -> bool:
+        """Désactive l'IP forwarding."""
+        return cls.set_ip_forwarding(False)
 
 
 class FirewallControl:
