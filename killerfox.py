@@ -283,36 +283,84 @@ def menu_scan_network():
     return targets
 
 
+def _select_target(prompt: str = "IP de la victime") -> Optional[str]:
+    """Helper pour sélectionner une cible avec affichage des cibles connues."""
+    # Afficher les cibles disponibles
+    if state.selected_targets:
+        console.print("[bold]Cibles mémorisées:[/]")
+        for i, ip in enumerate(state.selected_targets, 1):
+            host_info = state.discovered_hosts.get(ip, {})
+            if isinstance(host_info, dict):
+                vendor = host_info.get('vendor', '')
+            else:
+                vendor = getattr(host_info, 'vendor', '')
+            console.print(f"  [cyan]{i}[/]. {ip} {f'({vendor})' if vendor else ''}")
+        console.print()
+    
+    target_input = Prompt.ask(prompt)
+    
+    # Vérifier si c'est un numéro
+    if target_input.isdigit():
+        idx = int(target_input) - 1
+        if 0 <= idx < len(state.selected_targets):
+            return state.selected_targets[idx]
+    
+    # Vérifier si c'est "scan"
+    if target_input.lower() == "scan":
+        targets = menu_scan_network()
+        if targets:
+            return targets[0]
+        return None
+    
+    return target_input if target_input else None
+
+
+def _select_targets(prompt: str = "IP cible(s)") -> List[str]:
+    """Helper pour sélectionner plusieurs cibles."""
+    # Afficher les cibles disponibles
+    if state.selected_targets:
+        console.print("[bold]Cibles mémorisées:[/]")
+        for i, ip in enumerate(state.selected_targets, 1):
+            host_info = state.discovered_hosts.get(ip, {})
+            if isinstance(host_info, dict):
+                vendor = host_info.get('vendor', '')
+            else:
+                vendor = getattr(host_info, 'vendor', '')
+            console.print(f"  [cyan]{i}[/]. {ip} {f'({vendor})' if vendor else ''}")
+        console.print("  [cyan]all[/]. Toutes les cibles")
+        console.print()
+    
+    target_input = Prompt.ask(prompt, default="all" if state.selected_targets else "scan")
+    
+    # "all" = toutes les cibles mémorisées
+    if target_input.lower() == "all" and state.selected_targets:
+        return state.selected_targets.copy()
+    
+    # "scan" = scanner
+    if target_input.lower() == "scan":
+        return menu_scan_network() or []
+    
+    # Numéros séparés par virgule
+    if all(x.strip().isdigit() or x.strip() == "" for x in target_input.split(",")):
+        indices = [int(x.strip()) - 1 for x in target_input.split(",") if x.strip().isdigit()]
+        return [state.selected_targets[i] for i in indices if 0 <= i < len(state.selected_targets)]
+    
+    # IPs directes
+    return [ip.strip() for ip in target_input.split(",") if ip.strip()]
+
+
 def menu_arp_mitm():
     """Menu: ARP MITM."""
     console.print("\n[bold red]═══ ARP MITM Attack ═══[/]\n")
     
     # Sélectionner les cibles
-    if state.selected_targets:
-        use_previous = Confirm.ask(
-            f"Utiliser les cibles précédentes ({len(state.selected_targets)})?"
-        )
-        if use_previous:
-            targets = state.selected_targets
-        else:
-            targets = None
-    else:
-        targets = None
-    
-    if not targets:
-        target_input = Prompt.ask(
-            "IP cible(s) (séparées par virgule, ou 'scan' pour scanner)",
-            default="scan"
-        )
-        
-        if target_input.lower() == "scan":
-            targets = menu_scan_network()
-        else:
-            targets = [ip.strip() for ip in target_input.split(",")]
+    targets = _select_targets("IP cible(s) (séparées par virgule, 'all', ou 'scan')")
     
     if not targets:
         log.warning("Aucune cible sélectionnée")
         return
+    
+    console.print(f"\n[green]✓ Cibles sélectionnées: {', '.join(targets)}[/]\n")
     
     # Options avancées
     aggressive = Confirm.ask("Mode agressif (plus de paquets)?", default=False)
@@ -388,17 +436,21 @@ def menu_tcp_killer():
     """Menu: TCP Killer."""
     console.print("\n[bold yellow]═══ TCP Killer ═══[/]\n")
     
-    target = Prompt.ask("IP de la victime")
+    # Afficher les cibles disponibles
+    target = _select_target("IP de la victime")
+    if not target:
+        return
     
     console.print("\n[bold]Mode de blocage:[/]")
-    console.print("  1. Bloquer des sites spécifiques (domaines)")
-    console.print("  2. Bloquer des ports spécifiques")
-    console.print("  3. Bloquer tout le trafic TCP")
+    console.print("  [cyan]1[/]. Bloquer des sites spécifiques (domaines)")
+    console.print("  [cyan]2[/]. Bloquer des ports spécifiques")
+    console.print("  [cyan]3[/]. Bloquer tout le trafic TCP")
+    console.print()
     
     mode = Prompt.ask("Mode", choices=["1", "2", "3"], default="1")
     
     domains = None
-    ports = None
+    target_ports = None
     
     if mode == "1":
         domains_input = Prompt.ask(
@@ -411,7 +463,9 @@ def menu_tcp_killer():
             "Ports à bloquer (séparés par virgule)",
             default="443,80,8080"
         )
-        ports = [int(p.strip()) for p in ports_input.split(",")]
+        target_ports = [int(p.strip()) for p in ports_input.split(",") if p.strip().isdigit()]
+    
+    aggressive = Confirm.ask("Mode agressif?", default=True)
     
     if state.tcp_killer and state.tcp_killer.running:
         state.tcp_killer.stop()
@@ -419,11 +473,18 @@ def menu_tcp_killer():
     state.tcp_killer = TCPKiller(
         target_ip=target,
         blocked_domains=domains,
-        blocked_ports=ports
+        target_ports=target_ports,
+        aggressive=aggressive
     )
     state.tcp_killer.start()
     
-    console.print("\n[dim]Appuyez sur Entrée pour revenir au menu[/]")
+    log.success(f"TCP Killer actif sur {target}")
+    if domains:
+        log.info(f"  Domaines bloqués: {', '.join(domains)}")
+    if target_ports:
+        log.info(f"  Ports bloqués: {target_ports}")
+    
+    console.print("\n[dim]Appuyez sur Entrée pour revenir au menu (attaque continue en arrière-plan)[/]")
     input()
 
 
@@ -431,23 +492,35 @@ def menu_internet_blocker():
     """Menu: Internet Blocker."""
     console.print("\n[bold red]═══ Internet Blocker ═══[/]\n")
     
-    target = Prompt.ask("IP de la victime")
+    # Afficher les cibles disponibles
+    target = _select_target("IP de la victime")
+    if not target:
+        return
     
     console.print("\n[bold]Mode de blocage:[/]")
-    console.print("  1. Blocage TOTAL (aucun accès Internet)")
-    console.print("  2. Blocage sélectif (certains domaines)")
+    console.print("  [cyan]1[/]. Blocage TOTAL (aucun accès Internet)")
+    console.print("  [cyan]2[/]. Blocage sélectif (certains domaines)")
+    console.print("  [cyan]3[/]. Blocage par ports")
+    console.print()
     
-    mode = Prompt.ask("Mode", choices=["1", "2"], default="1")
+    mode = Prompt.ask("Mode", choices=["1", "2", "3"], default="1")
     
     full_block = (mode == "1")
     domains = None
+    ports = None
     
-    if not full_block:
+    if mode == "2":
         domains_input = Prompt.ask(
             "Domaines à bloquer",
             default="youtube.com,facebook.com,instagram.com"
         )
         domains = [d.strip() for d in domains_input.split(",")]
+    elif mode == "3":
+        ports_input = Prompt.ask(
+            "Ports à bloquer",
+            default="443,80"
+        )
+        ports = [int(p.strip()) for p in ports_input.split(",") if p.strip().isdigit()]
     
     auto_arp = Confirm.ask("Activer automatiquement l'ARP Spoof?", default=True)
     
@@ -455,14 +528,23 @@ def menu_internet_blocker():
         state.internet_blocker.stop()
     
     state.internet_blocker = InternetBlocker(
-        target_ip=target,
+        targets=[target],
         blocked_domains=domains,
+        blocked_ports=ports,
         full_block=full_block,
         auto_arp=auto_arp
     )
     state.internet_blocker.start()
     
-    console.print("\n[dim]Appuyez sur Entrée pour revenir au menu[/]")
+    log.success(f"Internet Blocker actif sur {target}")
+    if full_block:
+        log.info("  Mode: BLOCAGE TOTAL")
+    elif domains:
+        log.info(f"  Domaines bloqués: {', '.join(domains)}")
+    elif ports:
+        log.info(f"  Ports bloqués: {ports}")
+    
+    console.print("\n[dim]Appuyez sur Entrée pour revenir au menu (attaque continue en arrière-plan)[/]")
     input()
 
 
@@ -473,12 +555,18 @@ def menu_session_hijack():
     if not state.arp_spoofer or not state.arp_spoofer.running:
         log.warning("⚠️  ARP MITM recommandé pour le hijacking!")
     
-    target = Prompt.ask("IP de la victime")
+    # Sélectionner la cible
+    target = _select_target("IP de la victime")
+    if not target:
+        return
     
-    console.print("\n[bold]Mode d'attaque:[/]")
-    console.print("  1. [red]Phishing[/] - Afficher une fausse page de login")
-    console.print("  2. [yellow]BeEF Hook[/] - Injecter le hook BeEF")
-    console.print("  3. [cyan]Custom[/] - Injection personnalisée")
+    console.print(f"\n[green]✓ Cible: {target}[/]\n")
+    
+    console.print("[bold]Mode d'attaque:[/]")
+    console.print("  [cyan]1[/]. [red]Phishing[/] - Afficher une fausse page de login")
+    console.print("  [cyan]2[/]. [yellow]BeEF Hook[/] - Injecter le hook BeEF")
+    console.print("  [cyan]3[/]. [cyan]Custom[/] - Injection personnalisée")
+    console.print()
     
     mode_choice = Prompt.ask("Mode", choices=["1", "2", "3"], default="1")
     
@@ -529,8 +617,27 @@ def menu_http_inject():
     """Menu: HTTP Injection."""
     console.print("\n[bold cyan]═══ HTTP Injection ═══[/]\n")
     
-    target = Prompt.ask("IP cible (vide pour tous)", default="")
-    target_ips = {target} if target else None
+    if not state.arp_spoofer or not state.arp_spoofer.running:
+        log.warning("⚠️  ARP MITM recommandé pour l'injection HTTP!")
+    
+    # Afficher les cibles disponibles
+    console.print("[bold]IP cible (vide = toutes les cibles):[/]")
+    if state.selected_targets:
+        console.print("[dim]Cibles mémorisées:[/]")
+        for i, ip in enumerate(state.selected_targets, 1):
+            console.print(f"  [cyan]{i}[/]. {ip}")
+        console.print()
+    
+    target_input = Prompt.ask("IP cible (numéro, IP, ou vide)", default="")
+    
+    target_ips = None
+    if target_input:
+        if target_input.isdigit():
+            idx = int(target_input) - 1
+            if 0 <= idx < len(state.selected_targets):
+                target_ips = {state.selected_targets[idx]}
+        else:
+            target_ips = {target_input}
     
     console.print("\n[bold]Templates disponibles:[/]")
     templates = HTTPInjector.available_templates()

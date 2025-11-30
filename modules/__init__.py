@@ -5,7 +5,7 @@ from .scanner import NetworkScanner, scan_network
 from .arp_spoof import ARPSpoofer
 from .dns_spoof import DNSSpoofer
 from .tcp_killer import TCPKiller
-from .internet_control import InternetBlocker, block_internet
+from .internet_control import InternetBlocker
 from .session_hijack import SessionHijacker
 from .ssl_strip import SSLStripper
 from .http_injector import HTTPInjector
@@ -17,7 +17,6 @@ __all__ = [
     'DNSSpoofer',
     'TCPKiller',
     'InternetBlocker',
-    'block_internet',
     'SessionHijacker',
     'SSLStripper',
     'HTTPInjector'
