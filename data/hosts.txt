@@ -1,0 +1,4 @@
+# Exemple de règles DNS spoofing
+# 192.168.1.100   www.example.com
+# 192.168.1.100   *.bank.com
+# regex:.*(youtube|tiktok|netflix).*
